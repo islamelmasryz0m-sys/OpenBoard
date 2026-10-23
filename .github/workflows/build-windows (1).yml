@@ -1,0 +1,130 @@
+name: Build OpenBoard Mr Islam v4 (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 150
+
+    steps:
+      - name: Get the source code
+        uses: actions/checkout@v4
+        with:
+          path: OpenBoard
+
+      - name: Apply Mr. Islam changes (from the uploaded ZIP)
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem "OpenBoard" -Filter "OpenBoard-MrIslam-changes*.zip" | Select-Object -First 1
+          if (-not $zip) { throw "OpenBoard-MrIslam-changes.zip was not found in the repository" }
+          Write-Host "Using $($zip.Name)"
+          Expand-Archive $zip.FullName -DestinationPath "changes" -Force
+
+      - name: Copy the changed files over the original code
+        shell: cmd
+        run: xcopy "changes\OpenBoard-MrIslam-changes" "OpenBoard" /E /Y /I /H
+
+      - name: Get OpenBoard third-party libraries
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/OpenBoard-org/OpenBoard-ThirdParty.git OpenBoard-ThirdParty
+
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: 'qtwebengine qtwebchannel qtpositioning qtmultimedia qt5compat qtactiveqt qtimageformats qtpdf'
+          cache: true
+
+      - name: Set up Python (for the emoji pictures)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Get the emoji pictures (Noto Emoji 3D, Apache 2.0)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check pillow
+          New-Item -ItemType Directory -Force -Path noto-emoji | Out-Null
+          Set-Location noto-emoji
+          git init -q
+          git remote add origin https://github.com/googlefonts/noto-emoji.git
+          git config core.sparseCheckout true
+          $list = @("/LICENSE")
+          Get-Content "..\OpenBoard\resources\mrislam\emoji-manifest.txt" -Encoding UTF8 | Where-Object { $_.Trim() } | ForEach-Object { $list += "/3D/png/512/" + $_.Split("`t")[1] }
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) ".git\info\sparse-checkout"), (($list -join "`n") + "`n"))
+          git fetch -q --depth 1 --filter=blob:none origin e20cbc2bbec1926686be9f9bee7d1d2cfa1fea0e
+          if ($LASTEXITCODE -ne 0) { throw "could not download the emoji" }
+          git checkout -q FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "could not check out the emoji" }
+          Set-Location ..
+          python OpenBoard\resources\mrislam\make_emoji.py OpenBoard\resources\mrislam\emoji-manifest.txt noto-emoji emoji-ready
+          if ($LASTEXITCODE -ne 0) { throw "emoji preparation failed" }
+
+      - name: Set up Visual Studio compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build QuaZip
+        shell: cmd
+        working-directory: OpenBoard-ThirdParty/quazip
+        run: |
+          qmake quazip.pro "CONFIG+=release"
+          nmake release
+
+      - name: Build OpenBoard
+        shell: cmd
+        working-directory: OpenBoard
+        run: |
+          qmake OpenBoard.pro "CONFIG+=release"
+          lrelease OpenBoard.pro
+          nmake release-install
+
+      - name: Collect everything needed to run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $product = "OpenBoard\build\win32\release\product"
+          $tp = "OpenBoard-ThirdParty"
+          if (-not (Test-Path "$product\OpenBoard.exe")) { throw "OpenBoard.exe was not built" }
+          windeployqt --release --compiler-runtime "$product\OpenBoard.exe"
+          Copy-Item "$tp\poppler\bin\*.dll" $product -Force
+          Copy-Item "$tp\openssl\openssl-3.0.15-win64\bin\libssl-3-x64.dll" $product -Force
+          Copy-Item "$tp\openssl\openssl-3.0.15-win64\bin\libcrypto-3-x64.dll" $product -Force
+          Copy-Item "$tp\zlib\1.2.11\bin\zlib.dll" $product -Force
+          foreach ($dir in @("customizations", "startupHints", "fonts")) {
+            if (Test-Path "OpenBoard\resources\$dir") {
+              Copy-Item "OpenBoard\resources\$dir" "$product\$dir" -Recurse -Force
+            }
+          }
+          if (Test-Path "OpenBoard\resources\windows\xpdfrc") {
+            Copy-Item "OpenBoard\resources\windows\xpdfrc" $product -Force
+          }
+          Copy-Item "$tp\microsoft\vcredist_2015_2022.x64.exe" $product -Force
+          # Mr. Islam: emoji pictures and stickers, next to OpenBoard.exe
+          if (-not (Test-Path "emoji-ready\manifest.txt")) { throw "emoji pictures are missing" }
+          Copy-Item "emoji-ready" "$product\emoji" -Recurse -Force
+          New-Item -ItemType Directory -Force -Path "$product\stickers" | Out-Null
+          if (Test-Path "OpenBoard\resources\mrislam\stickers") {
+            Copy-Item "OpenBoard\resources\mrislam\stickers\*" "$product\stickers" -Force
+          }
+          $out = "OpenBoard-MrIslam-v4"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          Copy-Item $product $out -Recurse
+          Get-ChildItem $out -Recurse -Include *.pdb,*.ilk,*.exp | Remove-Item -Force
+          Compress-Archive -Path $out -DestinationPath "OpenBoard-MrIslam-v4-Windows.zip" -CompressionLevel Optimal
+
+      - name: Upload the ready-to-run ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenBoard-MrIslam-v4-Windows
+          path: OpenBoard-MrIslam-v4-Windows.zip
+          retention-days: 90
